@@ -287,7 +287,19 @@ static void llama_tensor_dequantize_impl(
 
 static bool tensor_allows_quantization(const llama_model_quantize_params * params, llm_arch arch, const ggml_tensor * tensor) {
     // trivial checks first -- no string ops needed
-    if (params->only_copy)       return false;
+    if (params->only_copy) {
+        // LOCAL PATCH: in COPY mode, still allow tensors explicitly
+        // named by --tensor-type/--tensor-type-file overrides to be (re)quantized —
+        // surgical single-tensor requants without touching the rest of the file.
+        bool overridden = false;
+        if (params->tt_overrides) {
+            const std::string name = ggml_get_name(tensor);
+            for (const auto * p = params->tt_overrides; p->pattern != nullptr; p++) {
+                if (std::regex_search(name, std::regex(p->pattern))) { overridden = true; break; }
+            }
+        }
+        if (!overridden) return false;
+    }
 
     // quantize only 2D and 3D tensors (experts)
     if (ggml_n_dims(tensor) < 2) return false;
@@ -804,6 +816,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q2_0: return GGML_TYPE_Q2_0;
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
+        case LLAMA_FTYPE_MOSTLY_NVFP4:     return GGML_TYPE_NVFP4;
 
         // K-quants
         case LLAMA_FTYPE_MOSTLY_Q2_K_S:
@@ -899,6 +912,14 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     if (params->only_copy) {
         ftype = ml.ftype;
+        // LOCAL PATCH: re-derive default_type from the model's real
+        // ftype so --tensor-type overrides in COPY mode see a quantized default
+        // (it was computed from LLAMA_FTYPE_COPY above → f32 → the manual-override
+        // branch in llama_tensor_get_type never ran and overrides became f32).
+        default_type = llama_ftype_get_default_type(ftype);
+        if (default_type == GGML_TYPE_COUNT) {
+            default_type = GGML_TYPE_F16;
+        }
     }
     std::unordered_map<std::string, std::vector<float>> i_data;
     const std::unordered_map<std::string, std::vector<float>> * imatrix_data = nullptr;
