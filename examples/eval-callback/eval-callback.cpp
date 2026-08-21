@@ -5,6 +5,7 @@
 #include "llama.h"
 
 #include <clocale>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -37,8 +38,6 @@ static bool run(llama_context * ctx, const common_params & params) {
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
-    common_debug_cb_user_data cb_data;
-
     common_params params;
 
     common_init();
@@ -47,13 +46,33 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // LLAMA_CB_FILTER: comma-separated regex patterns matched against the tensor
+    // name (same convention as common_debug_cb_user_data's own filters). Lets a
+    // targeted trace of a few named tensors run in ONE pass instead of dumping
+    // every graph tensor — on a large MoE model that is the difference between a
+    // practical whole-model per-layer trace and an impractical one, because the
+    // prohibitive cost is the PRINTING, not the compute.
+    std::vector<std::string> filters;
+    if (const char * f = std::getenv("LLAMA_CB_FILTER")) {
+        std::string s(f);
+        size_t pos = 0;
+        while (true) {
+            size_t comma = s.find(',', pos);
+            std::string pat = s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+            if (!pat.empty()) {
+                filters.push_back(pat);
+            }
+            if (comma == std::string::npos) {
+                break;
+            }
+            pos = comma + 1;
+        }
+    }
+    common_debug_cb_user_data cb_data(params, filters, false);
+
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    // pass the callback to the backend scheduler
-    // it will be executed for each node during the graph computation
-    params.cb_eval = common_debug_cb_eval;
-    params.cb_eval_user_data = &cb_data;
     params.warmup = false;
 
     // init
