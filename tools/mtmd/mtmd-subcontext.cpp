@@ -2638,6 +2638,25 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
             }
         }
 
+        // Cross-engine parity gate: full binary dump (f32 rows) when
+        // CLIP_DUMP_EMBD=<path>. Audio clips encode one call per 30s mel chunk, so
+        // suffix a per-call counter — without it successive chunks overwrite each
+        // other and only the last survives, which looks exactly like a correct
+        // single-chunk dump.
+        if (const char * dump_path = std::getenv("CLIP_DUMP_EMBD")) {
+            static int dump_counter = 0;
+            char dump_path_n[1024];
+            snprintf(dump_path_n, sizeof(dump_path_n), "%s.call%d", dump_path, dump_counter++);
+            FILE * fdump = fopen(dump_path_n, "wb");
+            if (fdump) {
+                int64_t hdr[2] = { n_embd, n_tokens };
+                fwrite(hdr, sizeof(int64_t), 2, fdump);
+                fwrite(emb_data.data(), sizeof(float), emb_data.size(), fdump);
+                fclose(fdump);
+                LOG_INF("CLIP_DUMP_EMBD: wrote %zu floats to %s\n", emb_data.size(), dump_path_n);
+            }
+        }
+
         // Print first few values of first token
         LOG_INF("Token 0 (first 16 values): ");
         for (int i = 0; i < std::min((int64_t)16, n_embd); i++) {
