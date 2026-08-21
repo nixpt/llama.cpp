@@ -4,6 +4,7 @@
 #include "log.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <regex>
 #include <string>
 #include <vector>
@@ -76,6 +77,21 @@ static float common_ggml_get_float_value(const uint8_t * data,
 
 #define INDENT "    "
 
+
+// Per-tensor print width, configurable via LLAMA_CB_ELEMS (elements printed
+// from EACH end of ne[0]/ne[1]/ne[2]). Upstream's default of 3 is fine for a
+// glance but not for a comparison: printing N from each end of a 2048-wide
+// hidden state samples 2N of 2048 dims — enough to localise a bug, not enough
+// to call a per-layer numerical gate complete. Setting LLAMA_CB_ELEMS >=
+// ne[0]/2 prints every element, with no elision.
+static int64_t common_debug_print_elems() {
+    static const int64_t n = [] {
+        const char * e = std::getenv("LLAMA_CB_ELEMS");
+        const int64_t v = e ? std::atoll(e) : 3;
+        return v > 0 ? v : 3;
+    }();
+    return n;
+}
 static void common_debug_print_tensor(uint8_t * data, ggml_type type, const int64_t * ne, const size_t * nb, int64_t n, bool abort_on_nan) {
     GGML_ASSERT(n > 0);
     float sum = 0;
@@ -183,7 +199,7 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
 
     if (!ggml_is_quantized(t->type) && matches_filter) {
         uint8_t * data = is_host ? (uint8_t *) t->data : pimpl->data.data();
-        common_debug_print_tensor(data, t->type, t->ne, t->nb, 3, pimpl->abort_on_nan);
+        common_debug_print_tensor(data, t->type, t->ne, t->nb, common_debug_print_elems(), pimpl->abort_on_nan);
     }
 
     return true;
