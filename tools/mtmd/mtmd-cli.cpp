@@ -199,6 +199,9 @@ static int generate_response(mtmd_cli_context & ctx, int n_predict) {
 
         llama_token token_id = common_sampler_sample(ctx.smpl, ctx.lctx, -1);
         generated_tokens.push_back(token_id);
+        if (std::getenv("MTMD_DUMP_TOKENS")) {
+            fprintf(stderr, "[MTMD_TOKEN] %d\n", token_id);
+        }
         common_sampler_accept(ctx.smpl, token_id, true);
 
         if (llama_vocab_is_eog(ctx.vocab, token_id) || ctx.check_antiprompt(generated_tokens)) {

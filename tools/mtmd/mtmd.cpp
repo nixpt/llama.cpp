@@ -1019,6 +1019,11 @@ struct mtmd_tokenizer {
     }
 
     void add_text(const std::vector<llama_token> & tokens) {
+        if (std::getenv("MTMD_DUMP_TOKENS")) {
+            for (auto t : tokens) {
+                fprintf(stderr, "[MTMD_PROMPT] %d\n", t);
+            }
+        }
         if (tokens.empty()) {
             return;
         }
@@ -1227,6 +1232,9 @@ struct mtmd_tokenizer {
                 LOG_DBG("image_tokens->ny = %d\n", image_tokens->ny);
                 LOG_DBG("batch_f32 size = %d\n", (int)image_tokens->batch_f32.entries.size());
 
+                if (std::getenv("MTMD_DUMP_TOKENS")) {
+                    fprintf(stderr, "[MTMD_PROMPT] IMG %d %d\n", image_tokens->nx, image_tokens->ny);
+                }
                 mtmd_input_chunk chunk{
                     MTMD_INPUT_CHUNK_TYPE_IMAGE,
                     {}, // text tokens
