@@ -20,6 +20,7 @@
 
 #include "yantra.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -27,6 +28,17 @@
 #include <vector>
 
 #define YANTRA_BUFFER_ALIGNMENT 64
+
+// Quantized MUL_MAT runs as one yantra QGemv per activation row; past this
+// many rows (prefill) the op stays on the CPU. GGML_YANTRA_QGEMV_ROWS
+// overrides it.
+#define YANTRA_QGEMV_MAX_ROWS 8
+
+// A QGemv job is charged 2 credits per output row against the node's
+// budget (4096 per vCPU), so a large weight (an LM head of 150k rows) is
+// split into row chunks, each its own resident buffer and job. 8192 rows
+// fit any node of 4+ vCPUs. GGML_YANTRA_ROW_CHUNK overrides it.
+#define YANTRA_ROW_CHUNK 8192
 
 // ---------------------------------------------------------------------------
 // The process-wide session and the resident-weight cache.
@@ -41,7 +53,8 @@ static std::mutex g_mutex;
 static YantraSession * g_session = nullptr;
 static bool g_session_tried = false;
 // Host address of a weight tensor's data -> its resident yantra buffer.
-static std::unordered_map<const void *, uint64_t> g_resident;
+// A quantized weight is held as row chunks (see yantra_row_chunk), one id each.
+static std::unordered_map<const void *, std::vector<uint64_t>> g_resident;
 
 // Opened on first use, closed at process exit (yantra frees everything).
 static YantraSession * yantra_session() {
@@ -241,26 +254,39 @@ static bool yantra_pending(const ggml_backend_yantra_context * ctx, const ggml_t
     return false;
 }
 
-// The device buffer holding `w`'s data in the layout the op wants:
-// resident and cached when `w` is a weight, otherwise a scratch upload.
-// For f32, yantra's Matmul wants B = W^T (K x N); ggml stores W as N rows of K.
-static bool yantra_weight(ggml_backend_yantra_context * ctx, YantraSession * s, const ggml_tensor * w, uint64_t * id) {
+static uint64_t yantra_row_chunk() {
+    static const uint64_t rows = [] {
+        const char * v = std::getenv("GGML_YANTRA_ROW_CHUNK");
+        const uint64_t r = v && *v ? (uint64_t) std::strtoull(v, nullptr, 10) : (uint64_t) YANTRA_ROW_CHUNK;
+        return r > 0 ? r : (uint64_t) YANTRA_ROW_CHUNK;
+    }();
+    return rows;
+}
+
+// The device buffers holding `w`'s data in the layout the op wants:
+// resident and cached when `w` is a weight, otherwise scratch uploads.
+// - f32: one buffer, W^T (K x N): yantra's Matmul wants B = W^T, and ggml
+//   stores W as N rows of K.
+// - quantized: ggml's blocks are QGemv's layout, uploaded as they are, in
+//   chunks of yantra_row_chunk() rows (the last one shorter).
+static bool yantra_weight(ggml_backend_yantra_context * ctx, YantraSession * s, const ggml_tensor * w,
+                          std::vector<uint64_t> & ids) {
     const bool is_weight = w->buffer && w->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
     if (is_weight) {
         std::lock_guard<std::mutex> lock(g_mutex);
         auto it = g_resident.find(w->data);
         if (it != g_resident.end()) {
-            *id = it->second;
+            ids = it->second;
             return true;
         }
     }
 
+    // (bytes, len) per chunk.
+    std::vector<std::pair<const void *, size_t>> parts;
     std::vector<float> transposed;
-    const void * bytes = w->data;
-    size_t len = ggml_nbytes(w);
+    const int64_t K = w->ne[0];
+    const int64_t N = w->ne[1];
     if (w->type == GGML_TYPE_F32) {
-        const int64_t K = w->ne[0];
-        const int64_t N = w->ne[1];
         const float * src = (const float *) w->data;
         transposed.resize((size_t) (K * N));
         for (int64_t n = 0; n < N; n++) {
@@ -268,19 +294,33 @@ static bool yantra_weight(ggml_backend_yantra_context * ctx, YantraSession * s, 
                 transposed[k * N + n] = src[n * K + k];
             }
         }
-        bytes = transposed.data();
-        len = transposed.size() * sizeof(float);
+        parts.emplace_back(transposed.data(), transposed.size() * sizeof(float));
+    } else {
+        const size_t row_bytes = ggml_row_size(w->type, K);
+        const uint64_t R = yantra_row_chunk();
+        for (uint64_t r0 = 0; r0 < (uint64_t) N; r0 += R) {
+            const uint64_t rows = std::min<uint64_t>(R, (uint64_t) N - r0);
+            parts.emplace_back((const char *) w->data + r0 * row_bytes, rows * row_bytes);
+        }
     }
 
-    if (is_weight) {
-        if (yantra_session_upload_resident(s, bytes, len, id) != YANTRA_OK) {
+    ids.clear();
+    for (const auto & [bytes, len] : parts) {
+        uint64_t id = 0;
+        if (is_weight) {
+            if (yantra_session_upload_resident(s, bytes, len, &id) != YANTRA_OK) {
+                return false;
+            }
+        } else if (!yantra_take(ctx, s, len, &id) || yantra_session_upload(s, id, 0, bytes, len) != YANTRA_OK) {
             return false;
         }
-        std::lock_guard<std::mutex> lock(g_mutex);
-        g_resident[w->data] = *id;
-        return true;
+        ids.push_back(id);
     }
-    return yantra_take(ctx, s, len, id) && yantra_session_upload(s, *id, 0, bytes, len) == YANTRA_OK;
+    if (is_weight) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_resident[w->data] = ids;
+    }
+    return true;
 }
 
 static bool yantra_mul_mat(ggml_backend_yantra_context * ctx, YantraSession * s, ggml_tensor * dst) {
@@ -290,21 +330,50 @@ static bool yantra_mul_mat(ggml_backend_yantra_context * ctx, YantraSession * s,
     const uint64_t N = (uint64_t) src0->ne[1];
     const uint64_t M = (uint64_t) src1->ne[1];
 
-    uint64_t w = 0, x = 0, c = 0;
-    if (!yantra_weight(ctx, s, src0, &w)) {
+    std::vector<uint64_t> w;
+    if (!yantra_weight(ctx, s, src0, w)) {
         return false;
     }
     switch (src0->type) {
         case GGML_TYPE_F32:
             {
+                uint64_t x = 0, c = 0;
                 if (!yantra_take(ctx, s, M * K * 4, &x) || !yantra_take(ctx, s, M * N * 4, &c)) {
                     return false;
                 }
                 if (yantra_session_upload(s, x, 0, src1->data, M * K * 4) != YANTRA_OK ||
-                    yantra_session_matmul_f32(s, x, w, c, M, N, K) != YANTRA_OK) {
+                    yantra_session_matmul_f32(s, x, w[0], c, M, N, K) != YANTRA_OK) {
                     return false;
                 }
                 ctx->reads.push_back({ c, 0, M * N * 4, dst->data });
+                return true;
+            }
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_0:
+            {
+                // y_m = W x_m per activation row m and weight chunk: QGemv
+                // names whole buffers, so each row gets its own (pooled) x,
+                // and each (row, chunk) its own y, read into its place.
+                const uint32_t fmt = src0->type == GGML_TYPE_Q8_0 ? YANTRA_Q8_0 : YANTRA_Q4_0;
+                const uint64_t R = yantra_row_chunk();
+                for (uint64_t m = 0; m < M; m++) {
+                    uint64_t xm = 0;
+                    const char * row = (const char *) src1->data + m * src1->nb[1];
+                    if (!yantra_take(ctx, s, K * 4, &xm) || yantra_session_upload(s, xm, 0, row, K * 4) != YANTRA_OK) {
+                        return false;
+                    }
+                    for (size_t c = 0; c < w.size(); c++) {
+                        const uint64_t r0 = c * R;
+                        const uint64_t rows = std::min<uint64_t>(R, N - r0);
+                        uint64_t ym = 0;
+                        if (!yantra_take(ctx, s, rows * 4, &ym) ||
+                            yantra_session_qgemv(s, fmt, w[c], xm, ym, rows, K) != YANTRA_OK) {
+                            return false;
+                        }
+                        ctx->reads.push_back(
+                            { ym, 0, rows * 4, (char *) dst->data + m * dst->nb[1] + r0 * sizeof(float) });
+                    }
+                }
                 return true;
             }
         default:
@@ -500,6 +569,14 @@ static ggml_backend_buffer_type_t ggml_backend_yantra_device_get_buffer_type(ggm
     GGML_UNUSED(dev);
 }
 
+static int64_t yantra_qgemv_max_rows() {
+    static const int64_t rows = [] {
+        const char * v = std::getenv("GGML_YANTRA_QGEMV_ROWS");
+        return v && *v ? (int64_t) std::strtoll(v, nullptr, 10) : (int64_t) YANTRA_QGEMV_MAX_ROWS;
+    }();
+    return rows;
+}
+
 static bool ggml_backend_yantra_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_NONE:
@@ -522,7 +599,16 @@ static bool ggml_backend_yantra_device_supports_op(ggml_backend_dev_t dev, const
                 if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
                     return false;
                 }
-                return src0->type == GGML_TYPE_F32;
+                switch (src0->type) {
+                    case GGML_TYPE_F32:
+                        return true;
+                    case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_Q4_0:
+                        // ggml's blocks are yantra's QGemv layout (32 weights a block).
+                        return src0->ne[0] % 32 == 0 && src1->ne[1] <= yantra_qgemv_max_rows();
+                    default:
+                        return false;
+                }
             }
         default:
             return false;
