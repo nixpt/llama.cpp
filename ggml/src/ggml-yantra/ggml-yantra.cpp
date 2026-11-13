@@ -330,6 +330,13 @@ static enum ggml_status ggml_backend_yantra_graph_compute(ggml_backend_t backend
                     ok = yantra_flush(ctx, s);
                 }
                 ok = ok && yantra_mul_mat(ctx, s, node);
+                if (!ok) {
+                    // An alloc, upload or job the node refused (memory cap,
+                    // credits, a dropped connection).
+                    GGML_LOG_ERROR("%s: yantra refused %s (%s, %lld x %lld rows)\n", __func__, node->name,
+                                   ggml_type_name(node->src[0]->type), (long long) node->src[0]->ne[1],
+                                   (long long) node->src[1]->ne[1]);
+                }
                 if (node->src[0]->type == GGML_TYPE_F32) {
                     ctx->n_mm_f32++;
                 } else {
