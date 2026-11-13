@@ -5,10 +5,13 @@
 // `remote:SPEC` a rented node. Unset, the backend registers no device and
 // nothing changes.
 //
-// Buffers are host memory ("host-shadowed"): the CPU backend runs every op
-// yantra does not, on the same bytes, with no copies. A weight a supported
-// op uses is uploaded to yantra once, content-addressed and resident, and
-// named by id afterwards; only activations go up and only results come down.
+// An ACCEL device, like ggml-blas: it holds no memory of its own. Weights
+// stay in the CPU backend's host buffers, and the scheduler hands this
+// backend the MUL_MATs it accepts on them (small batches); everything else,
+// prefill included, stays on the CPU, on the same bytes, with no copies.
+// A weight is uploaded to yantra on first use, content-addressed and
+// resident, and named by id afterwards; only activations go up and only
+// results come down.
 //
 // One exchange per graph split: activation uploads and jobs are queued in
 // the session, and one download_many of the split's outputs sends them all.
@@ -21,13 +24,12 @@
 #include "yantra.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
-
-#define YANTRA_BUFFER_ALIGNMENT 64
 
 // Quantized MUL_MAT runs as one yantra QGemv per activation row; past this
 // many rows (prefill) the op stays on the CPU. GGML_YANTRA_QGEMV_ROWS
@@ -52,9 +54,39 @@ static bool yantra_enabled() {
 static std::mutex g_mutex;
 static YantraSession * g_session = nullptr;
 static bool g_session_tried = false;
-// Host address of a weight tensor's data -> its resident yantra buffer.
+// Host address of a weight tensor's data -> its resident yantra buffers.
 // A quantized weight is held as row chunks (see yantra_row_chunk), one id each.
-static std::unordered_map<const void *, std::vector<uint64_t>> g_resident;
+// The weights live in buffers this backend does not own, so nothing tells it
+// when they change or go away: each use checks that the entry still
+// describes the same bytes (buffer, shape, type and a sampled fingerprint)
+// and uploads again if not.
+struct yantra_resident {
+    const void * buffer;
+    int64_t ne0;
+    int64_t ne1;
+    ggml_type type;
+    uint64_t fingerprint;
+    std::vector<uint64_t> ids;
+};
+static std::unordered_map<const void *, yantra_resident> g_resident;
+
+// FNV-1a over 64 words spread across the tensor's bytes: cheap enough to run
+// on every use, and enough to tell one model's weight from another's.
+static uint64_t yantra_fingerprint(const ggml_tensor * w) {
+    const size_t n = ggml_nbytes(w);
+    const unsigned char * p = (const unsigned char *) w->data;
+    uint64_t h = 1469598103934665603ULL;
+    const size_t samples = 64;
+    for (size_t i = 0; i < samples; i++) {
+        const size_t off = n <= 8 ? 0 : (n - 8) / (samples - 1) * i;
+        uint64_t word = 0;
+        std::memcpy(&word, p + off, std::min<size_t>(8, n));
+        for (int b = 0; b < 8; b++) {
+            h = (h ^ ((word >> (8 * b)) & 0xff)) * 1099511628211ULL;
+        }
+    }
+    return h;
+}
 
 // Opened on first use, closed at process exit (yantra frees everything).
 static YantraSession * yantra_session() {
@@ -70,131 +102,6 @@ static YantraSession * yantra_session() {
     return g_session;
 }
 
-// Forget cached weights that lie in [base, base + size): their bytes changed
-// or their buffer is going away. (A freed resident buffer stays on the
-// device until the session closes; the capi does not free resident ones.)
-static void yantra_forget(const void * base, size_t size) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    const char * lo = (const char *) base;
-    for (auto it = g_resident.begin(); it != g_resident.end();) {
-        const char * p = (const char *) it->first;
-        if (p >= lo && p < lo + size) {
-            it = g_resident.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Buffer: host memory.
-// ---------------------------------------------------------------------------
-
-struct ggml_backend_yantra_buffer_context {
-    void * data;
-    size_t size;
-};
-
-static void ggml_backend_yantra_buffer_free_buffer(ggml_backend_buffer_t buffer) {
-    auto * ctx = (ggml_backend_yantra_buffer_context *) buffer->context;
-    yantra_forget(ctx->data, ctx->size);
-    ggml_aligned_free(ctx->data, ctx->size);
-    delete ctx;
-}
-
-static void * ggml_backend_yantra_buffer_get_base(ggml_backend_buffer_t buffer) {
-    return ((ggml_backend_yantra_buffer_context *) buffer->context)->data;
-}
-
-static void ggml_backend_yantra_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value,
-                                                     size_t offset, size_t size) {
-    yantra_forget(tensor->data, ggml_nbytes(tensor));
-    memset((char *) tensor->data + offset, value, size);
-    GGML_UNUSED(buffer);
-}
-
-static void ggml_backend_yantra_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
-                                                  size_t offset, size_t size) {
-    yantra_forget(tensor->data, ggml_nbytes(tensor));
-    memcpy((char *) tensor->data + offset, data, size);
-    GGML_UNUSED(buffer);
-}
-
-static void ggml_backend_yantra_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data,
-                                                  size_t offset, size_t size) {
-    memcpy(data, (const char *) tensor->data + offset, size);
-    GGML_UNUSED(buffer);
-}
-
-static bool ggml_backend_yantra_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
-    if (ggml_backend_buffer_is_host(src->buffer)) {
-        yantra_forget(dst->data, ggml_nbytes(dst));
-        memcpy(dst->data, src->data, ggml_nbytes(src));
-        return true;
-    }
-    return false;
-    GGML_UNUSED(buffer);
-}
-
-static void ggml_backend_yantra_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
-    auto * ctx = (ggml_backend_yantra_buffer_context *) buffer->context;
-    yantra_forget(ctx->data, ctx->size);
-    memset(ctx->data, value, ctx->size);
-}
-
-static const ggml_backend_buffer_i ggml_backend_yantra_buffer_i = {
-    /* .free_buffer     = */ ggml_backend_yantra_buffer_free_buffer,
-    /* .get_base        = */ ggml_backend_yantra_buffer_get_base,
-    /* .init_tensor     = */ NULL,
-    /* .memset_tensor   = */ ggml_backend_yantra_buffer_memset_tensor,
-    /* .set_tensor      = */ ggml_backend_yantra_buffer_set_tensor,
-    /* .get_tensor      = */ ggml_backend_yantra_buffer_get_tensor,
-    /* .set_tensor_2d   = */ NULL,
-    /* .get_tensor_2d   = */ NULL,
-    /* .cpy_tensor      = */ ggml_backend_yantra_buffer_cpy_tensor,
-    /* .clear           = */ ggml_backend_yantra_buffer_clear,
-    /* .reset           = */ NULL,
-    /* .set_tensor_n    = */ NULL,
-    /* .get_tensor_n    = */ NULL,
-    /* .cpy_tensor_n    = */ NULL,
-};
-
-// ---------------------------------------------------------------------------
-// Buffer type.
-// ---------------------------------------------------------------------------
-
-static const char * ggml_backend_yantra_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
-    return "Yantra";
-    GGML_UNUSED(buft);
-}
-
-static ggml_backend_buffer_t ggml_backend_yantra_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    size = size == 0 ? 1 : size;
-    void * data = ggml_aligned_malloc(size);
-    if (data == nullptr) {
-        GGML_LOG_ERROR("%s: failed to allocate %zu bytes\n", __func__, size);
-        return nullptr;
-    }
-    auto * ctx = new ggml_backend_yantra_buffer_context{ data, size };
-    return ggml_backend_buffer_init(buft, ggml_backend_yantra_buffer_i, ctx, size);
-}
-
-static size_t ggml_backend_yantra_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    return YANTRA_BUFFER_ALIGNMENT;
-    GGML_UNUSED(buft);
-}
-
-static bool ggml_backend_yantra_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
-    return true;
-    GGML_UNUSED(buft);
-}
-
-static ggml_backend_buffer_type_t ggml_backend_yantra_buffer_type();
-
-static bool ggml_backend_buft_is_yantra(ggml_backend_buffer_type_t buft) {
-    return buft == ggml_backend_yantra_buffer_type();
-}
-
 // ---------------------------------------------------------------------------
 // Backend: graph compute.
 // ---------------------------------------------------------------------------
@@ -206,6 +113,11 @@ struct ggml_backend_yantra_context {
     std::vector<std::pair<uint64_t, uint64_t>> in_use;  // (size, id)
     // This graph's pending reads, and the host ranges they will fill.
     std::vector<YantraRead> reads;
+    // Counters for GGML_YANTRA_STATS: graphs computed here, and MUL_MATs
+    // run on yantra by weight type.
+    uint64_t n_graphs = 0;
+    uint64_t n_mm_f32 = 0;
+    uint64_t n_mm_quant = 0;
 };
 
 static bool yantra_take(ggml_backend_yantra_context * ctx, YantraSession * s, uint64_t size, uint64_t * id) {
@@ -272,12 +184,22 @@ static uint64_t yantra_row_chunk() {
 static bool yantra_weight(ggml_backend_yantra_context * ctx, YantraSession * s, const ggml_tensor * w,
                           std::vector<uint64_t> & ids) {
     const bool is_weight = w->buffer && w->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+    uint64_t fp = 0;
     if (is_weight) {
+        fp = yantra_fingerprint(w);
         std::lock_guard<std::mutex> lock(g_mutex);
         auto it = g_resident.find(w->data);
         if (it != g_resident.end()) {
-            ids = it->second;
-            return true;
+            const yantra_resident & r = it->second;
+            if (r.buffer == w->buffer && r.ne0 == w->ne[0] && r.ne1 == w->ne[1] && r.type == w->type &&
+                r.fingerprint == fp) {
+                ids = r.ids;
+                return true;
+            }
+            // Different bytes at this address now: upload them below. (The
+            // old resident buffer stays on the device until the session
+            // closes; the capi does not free resident buffers.)
+            g_resident.erase(it);
         }
     }
 
@@ -318,7 +240,7 @@ static bool yantra_weight(ggml_backend_yantra_context * ctx, YantraSession * s, 
     }
     if (is_weight) {
         std::lock_guard<std::mutex> lock(g_mutex);
-        g_resident[w->data] = ids;
+        g_resident[w->data] = yantra_resident{ w->buffer, w->ne[0], w->ne[1], w->type, fp, ids };
     }
     return true;
 }
@@ -388,6 +310,7 @@ static enum ggml_status ggml_backend_yantra_graph_compute(ggml_backend_t backend
         return GGML_STATUS_FAILED;
     }
     bool ok = true;
+    ctx->n_graphs++;
     for (int i = 0; ok && i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (ggml_is_empty(node)) {
@@ -407,6 +330,11 @@ static enum ggml_status ggml_backend_yantra_graph_compute(ggml_backend_t backend
                     ok = yantra_flush(ctx, s);
                 }
                 ok = ok && yantra_mul_mat(ctx, s, node);
+                if (node->src[0]->type == GGML_TYPE_F32) {
+                    ctx->n_mm_f32++;
+                } else {
+                    ctx->n_mm_quant++;
+                }
                 break;
             default:
                 GGML_LOG_ERROR("%s: unsupported op %s\n", __func__, ggml_op_desc(node));
@@ -429,12 +357,16 @@ static const char * ggml_backend_yantra_get_name(ggml_backend_t backend) {
 
 static void ggml_backend_yantra_free(ggml_backend_t backend) {
     auto * ctx = (ggml_backend_yantra_context *) backend->context;
-    // GGML_YANTRA_STATS=1: the session's counters (round trips, bytes) on stderr.
+    // GGML_YANTRA_STATS=1: this backend's op counters and the session's
+    // (round trips, bytes) on stderr. Plain fprintf: the caller's logger may
+    // already be gone when the backend is freed at exit.
     const char * stats = std::getenv("GGML_YANTRA_STATS");
     if (stats && *stats && *stats != '0' && g_session) {
         char * js = yantra_session_stats_json(g_session);
+        fprintf(stderr, "yantra stats: graphs=%llu mul_mat_f32=%llu mul_mat_quant=%llu session=%s\n",
+                (unsigned long long) ctx->n_graphs, (unsigned long long) ctx->n_mm_f32,
+                (unsigned long long) ctx->n_mm_quant, js ? js : "null");
         if (js) {
-            GGML_LOG_INFO("yantra stats: %s\n", js);
             yantra_string_free(js);
         }
     }
@@ -506,21 +438,19 @@ static const char * ggml_backend_yantra_device_get_description(ggml_backend_dev_
 }
 
 static void ggml_backend_yantra_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
-    // Buffers are host memory; the node's limit is what bounds residency.
-    // GGML_YANTRA_MEMORY overrides the 8 GiB a local node may hold.
-    size_t bytes = (size_t) 8 << 30;
-    if (const char * v = std::getenv("GGML_YANTRA_MEMORY")) {
-        bytes = (size_t) std::strtoull(v, nullptr, 10);
-    }
-    *free = bytes;
-    *total = bytes;
+    // No memory of its own: weights stay in the CPU backend's buffers.
+    *free = 0;
+    *total = 0;
     GGML_UNUSED(dev);
 }
 
 static enum ggml_backend_dev_type ggml_backend_yantra_device_get_type(ggml_backend_dev_t dev) {
-    // GPU, not ACCEL: layers offloaded to it put their weights in its buffer
-    // type, which is what lets a weight be uploaded once and stay resident.
-    return GGML_BACKEND_DEVICE_TYPE_GPU;
+    // ACCEL, not GPU. A GPU device gets weights placed in its buffer type
+    // only if it accepts llama's load-time probe, a MUL_MAT with a 512-row
+    // batch, and QGemv takes small batches only. As ACCEL (the ggml-blas
+    // pattern) the weights stay in host buffers and the scheduler offers this
+    // backend each MUL_MAT on them, batch by batch, ahead of the CPU.
+    return GGML_BACKEND_DEVICE_TYPE_ACCEL;
     GGML_UNUSED(dev);
 }
 
@@ -544,28 +474,8 @@ static ggml_backend_t ggml_backend_yantra_device_init_backend(ggml_backend_dev_t
     GGML_UNUSED(params);
 }
 
-static const ggml_backend_buffer_type_i ggml_backend_yantra_buffer_type_i = {
-    /* .get_name         = */ ggml_backend_yantra_buffer_type_get_name,
-    /* .alloc_buffer     = */ ggml_backend_yantra_buffer_type_alloc_buffer,
-    /* .alloc_buffer_n   = */ NULL,
-    /* .get_alignment    = */ ggml_backend_yantra_buffer_type_get_alignment,
-    /* .get_max_size     = */ NULL,
-    /* .get_alloc_size   = */ NULL,
-    /* .get_alloc_size_n = */ NULL,
-    /* .is_host          = */ ggml_backend_yantra_buffer_type_is_host,
-};
-
-static ggml_backend_buffer_type_t ggml_backend_yantra_buffer_type() {
-    static ggml_backend_buffer_type buft = {
-        /* .iface   = */ ggml_backend_yantra_buffer_type_i,
-        /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_yantra_reg(), 0),
-        /* .context = */ nullptr,
-    };
-    return &buft;
-}
-
 static ggml_backend_buffer_type_t ggml_backend_yantra_device_get_buffer_type(ggml_backend_dev_t dev) {
-    return ggml_backend_yantra_buffer_type();
+    return ggml_backend_cpu_buffer_type();
     GGML_UNUSED(dev);
 }
 
@@ -599,6 +509,11 @@ static bool ggml_backend_yantra_device_supports_op(ggml_backend_dev_t dev, const
                 if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
                     return false;
                 }
+                // Plain host bytes only: a CPU "extra" buffer (repack) holds
+                // the weight in another layout.
+                if (src0->buffer && !ggml_backend_buffer_is_host(src0->buffer)) {
+                    return false;
+                }
                 switch (src0->type) {
                     case GGML_TYPE_F32:
                         return true;
@@ -617,7 +532,7 @@ static bool ggml_backend_yantra_device_supports_op(ggml_backend_dev_t dev, const
 }
 
 static bool ggml_backend_yantra_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    return ggml_backend_buft_is_yantra(buft);
+    return ggml_backend_buft_is_host(buft);
     GGML_UNUSED(dev);
 }
 
