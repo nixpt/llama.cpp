@@ -70,6 +70,10 @@
 #include "ggml-rpc.h"
 #endif
 
+#ifdef GGML_USE_YANTRA
+#include "ggml-yantra.h"
+#endif
+
 #ifdef GGML_USE_VIRTGPU_FRONTEND
 #include "ggml-virtgpu.h"
 #endif
@@ -158,6 +162,9 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_BLAS
         register_backend(ggml_backend_blas_reg());
+#endif
+#ifdef GGML_USE_YANTRA
+        register_backend(ggml_backend_yantra_reg());
 #endif
 #ifdef GGML_USE_RPC
         register_backend(ggml_backend_rpc_reg());

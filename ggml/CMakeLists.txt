@@ -234,6 +234,9 @@ option(GGML_WEBGPU_CPU_PROFILE              "ggml: enable WebGPU profiling (CPU)
 option(GGML_WEBGPU_GPU_PROFILE              "ggml: enable WebGPU profiling (GPU)"             OFF)
 option(GGML_WEBGPU_JSPI                     "ggml: use JSPI for WebGPU"                       ON)
 option(GGML_ZDNN                            "ggml: use zDNN"                                  OFF)
+option(GGML_YANTRA                          "ggml: use yantra (nixpt/yantra#211)"             OFF)
+set(YANTRA_LIB         "" CACHE FILEPATH "ggml: yantra-capi's libyantra.a (GGML_YANTRA)")
+set(YANTRA_INCLUDE_DIR "" CACHE PATH     "ggml: yantra's include/ dir (GGML_YANTRA)")
 option(GGML_VIRTGPU                         "ggml: use the VirtGPU/Virglrenderer API Remoting frontend"     OFF)
 option(GGML_VIRTGPU_BACKEND                 "ggml: build the VirtGPU/Virglrenderer API Remoting backend"    OFF)
 option(GGML_METAL                           "ggml: use Metal"                                 ${GGML_METAL_DEFAULT})
@@ -331,6 +334,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-alloc.h
     include/ggml-backend.h
     include/ggml-blas.h
+    include/ggml-yantra.h
     include/ggml-cann.h
     include/ggml-cpp.h
     include/ggml-cuda.h
